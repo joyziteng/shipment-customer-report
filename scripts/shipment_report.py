@@ -510,13 +510,15 @@ def build_updates(item, records, start, end, issues):
     blank_zero = sheet_prefers_blank(item)
     preserved_formulas = []
 
-    def writable(r, col):
-        """Never overwrite a live formula cell; Excel recalculates it from inputs."""
+    def place(r, col, value, f, m, group_records):
+        """Write a value; for formula cells keep the formula and refresh its cached result."""
         cell = ws.cell(r, col)
         if cell.data_type == 'f':
-            preserved_formulas.append({'单元格': f'{get_column_letter(col)}{r}'})
-            return False
-        return True
+            changes[(r, col)] = ('formula-value', value, None)
+            preserved_formulas.append(f'{get_column_letter(col)}{r}')
+        else:
+            changes[(r, col)] = ('number', value, template_style(item, f, m, r))
+        record_expected(r, col, value, group_records, (f, m))
 
     def record_expected(r, col, value, group, kind):
         old = cached.cell(r, col).value
@@ -548,10 +550,7 @@ def build_updates(item, records, start, end, issues):
                 old = cached.cell(r, col).value if item['mode'] == '原区间' else None
                 if value == 0 and (old is None if item['mode'] == '原区间' else blank_zero):
                     continue  # keep the sheet's blank-for-zero convention
-                if not writable(r, col):
-                    continue  # live formula: Excel recomputes it from the updated row
-                changes[(r, col)] = ('number', value, template_style(item, f, m, r))
-                record_expected(r, col, value, group['records'], (f, m))
+                place(r, col, value, f, m, group['records'])
         # Sum only the values actually visible, including any preserved cells.
         for m in ('units', 'cbm'):
             col = cols[(f, m)]
@@ -571,9 +570,7 @@ def build_updates(item, records, start, end, issues):
             if missing:
                 issues.append({'类型': '区间汇总不完整', '页': ws.title, '货代': f, '指标': m, '行': missing,
                                '处理': '汇总仅包括可确认数值，须结合原始汇总核对'})
-            if writable(summary, col):
-                changes[(summary, col)] = ('number', total, template_style(item, f, m, summary))
-            record_expected(summary, col, total, [], (f, m))
+            place(summary, col, total, f, m, [])
             if m == 'units':
                 total_units = total
         all_orders = [cached.cell(r, 5).value for r in rows]
@@ -581,15 +578,13 @@ def build_updates(item, records, start, end, issues):
             total_order = sum((decimal(v) for v in all_orders), Decimal(0))
             percent_col = cols[(f, 'percent')]
             ratio = total_units / total_order
-            if writable(summary, percent_col):
-                changes[(summary, percent_col)] = ('number', ratio, template_style(item, f, 'percent', summary))
-                record_expected(summary, percent_col, ratio, [], (f, 'percent'))
+            place(summary, percent_col, ratio, f, 'percent', [])
         else:
             issues.append({'类型': '汇总订单量不可用，比例保留', '页': ws.title, '货代': f})
     if preserved_formulas:
-        issues.append({'类型': '目标单元格原为公式，保留不覆盖', '页': ws.title,
-                       '单元格': [x['单元格'] for x in preserved_formulas],
-                       '处理': '打开工作簿后由公式自行重算；差异值见“覆盖差异”'})
+        issues.append({'类型': '公式单元格保留公式并刷新缓存', '页': ws.title,
+                       '单元格': preserved_formulas,
+                       '处理': '公式未改动，仅写入重算后的结果；差异见“覆盖差异”'})
     if blocked:
         issues.append({'类型': '部分明细保留原值', '页': ws.title,
                        '单元格': [f'{get_column_letter(cols[(f, m)])}{r}' for r, f, m in sorted(blocked)],
@@ -715,16 +710,28 @@ def make_cell(prefix, row, col, change, attrs, body):
         attrs = f' r="{get_column_letter(col)}{row}"'.encode()
         if style_id:
             attrs += f' s="{style_id}"'.encode()
-    else:
-        # Shared/array formulas span multiple cells and cannot safely be split.
-        if body and re.search(rb'<(?:[\w.-]+:)?f\b[^>]*\bt\s*=\s*["\'](?:shared|array|dataTable)["\']', body):
-            raise ValueError(f'{get_column_letter(col)}{row} 属于共享或数组公式，不能局部覆盖')
-        if body and re.search(rb'<(?:[\w.-]+:)?(?:extLst|ext)\b', body):
-            raise ValueError(f'{get_column_letter(col)}{row} 含单元格扩展元数据，不能安全覆盖')
-        attrs = re.sub(rb'\s+t\s*=\s*(["\']).*?\1', b'', attrs)
+        return b'<' + prefix + b'c' + attrs + (
+            (b' t="inlineStr"><' + prefix + b'is><' + prefix + b't>' + escape(str(value)).encode('utf-8')
+             + b'</' + prefix + b't></' + prefix + b'is>') if kind == 'text' else
+            (b'><' + prefix + b'v>' + format(value, 'f').encode() + b'</' + prefix + b'v>')
+        ) + b'</' + prefix + b'c>'
+    # Cell extension metadata cannot be reconstructed safely; leave such cells alone.
+    if body and re.search(rb'<(?:[\w.-]+:)?(?:extLst|ext)\b', body):
+        raise ValueError(f'{get_column_letter(col)}{row} 含单元格扩展元数据，不能安全覆盖')
+    attrs = re.sub(rb'\s+t\s*=\s*(["\']).*?\1', b'', attrs)
     if kind == 'text':
         attrs += b' t="inlineStr"'
         contents = b'<' + prefix + b'is><' + prefix + b't>' + escape(str(value)).encode('utf-8') + b'</' + prefix + b't></' + prefix + b'is>'
+    elif kind == 'formula-value':
+        # Keep the original <f> element (including shared/array attributes) verbatim
+        # and only refresh the cached <v> result, so viewers without recalculation
+        # still show correct numbers.
+        fmatch = re.search(rb'<(?:[\w.-]+:)?f\b[^>]*(?:/>|>.*?</(?:[\w.-]+:)?f\s*>)', body or b'', re.S)
+        if not fmatch:
+            raise ValueError(f'{get_column_letter(col)}{row} 声称是公式但缺少 f 元素')
+        if not value.is_finite():
+            raise ValueError(f'{get_column_letter(col)}{row} 数值无效')
+        contents = fmatch.group(0) + b'<' + prefix + b'v>' + format(value, 'f').encode() + b'</' + prefix + b'v>'
     else:
         if not value.is_finite():
             raise ValueError(f'{get_column_letter(col)}{row} 数值无效')

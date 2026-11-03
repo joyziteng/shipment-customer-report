@@ -160,13 +160,14 @@ class ShipmentReportTests(unittest.TestCase):
         self.assertEqual(formula_wb['TOTALS']['B2'].value, '=1+1')
         self.assertEqual(formula_wb['PO#_260823TP']['N2'].value, '=1+2')
         self.assertEqual(po['H1'].value, 'Ttl Units Shipped 10/12-10/16 (via LAURA)')
-        # K7 is a live SUM formula in the original: preserved, not overwritten with a value
+        # K7 keeps its SUM formula but the cached result is refreshed, so viewers
+        # without recalculation already show the correct total.
         self.assertEqual(str(formula_wb['PO#_260823TP']['K7'].value).upper(), '=SUM(K2:K6)')
-        # M7 has no formula (plain value cell): the recomputed total is written
+        self.assertAlmostEqual(po['K7'].value, sum(po[f'K{r}'].value for r in range(2, 7)))
         self.assertAlmostEqual(po['M7'].value, sum(v for v in (po[f'M{r}'].value for r in range(2, 7))
                                                   if isinstance(v, (int, float))))
-        preserved = next(i for i in issues['待确认'] if i['类型'] == '目标单元格原为公式，保留不覆盖')
-        self.assertIn('K7', preserved['单元格'])
+        refreshed = next(i for i in issues['待确认'] if i['类型'] == '公式单元格保留公式并刷新缓存')
+        self.assertIn('K7', refreshed['单元格'])
 
     def test_original_column_layout_still_supported(self):
         """The pre-November layout (外合同G/数量K) must still resolve by header name."""
