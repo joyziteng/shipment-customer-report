@@ -66,18 +66,34 @@ class ShipmentReportTests(unittest.TestCase):
         decoy.append(['260823TP', 'CBL009', 'Pillow', 'Bear', 1, None, 1])
         wb.save(self.customer)
 
-    def build_source(self):
+    def build_source(self, reordered=True):
         wb = Workbook()
         wb.active.title = 'unrelated'
         ws = wb.create_sheet(report.SOURCE_TITLE)
-        for c, header in report.SOURCE_HEADERS.items():
+        # Header-name lookup must work with the reordered 2026-11 layout:
+        # 款号5 数量7 特殊说明15 外合同9 工厂提货日14 总体积19 货代反馈25 货代32
+        positions = ({5: '款号', 8: '产品描述', 9: '外合同', 7: '数量', 14: '工厂提货日',
+                      19: '总体积', 15: '特殊说明', 25: '货代反馈情况', 32: '货代'}
+                     if reordered else
+                     {5: '款号', 6: '产品描述', 7: '外合同', 11: '数量', 14: '工厂提货日',
+                      19: '总体积', 25: '货代反馈情况', 32: '货代'})
+        for c, header in positions.items():
             ws.cell(1, c, header)
-        def add(key, color, day, q, cbm, forwarder='FLEXPORT', note=None, sty='CBL009'):
+        P = {k: v for k, v in positions.items() if k != '产品描述'}
+        if reordered:
+            self.pos = {'sty': 5, 'desc': 8, 'key': 9, 'q': 7, 'day': 14, 'cbm': 19,
+                        'note': 25, 'forwarder': 32, 'o': 15}
+        else:
+            self.pos = {'sty': 5, 'desc': 6, 'key': 7, 'q': 11, 'day': 14, 'cbm': 19,
+                        'note': 25, 'forwarder': 32, 'o': None}
+        def add(key, color, day, q, cbm, forwarder='FLEXPORT', note=None, sty='CBL009', o=None):
             r = ws.max_row + 1
-            for c, value in {5: sty, 6: f'CloudFreeze Pillow {color}', 7: key, 11: q,
-                             14: day, 19: cbm, 25: note, 32: forwarder}.items():
-                if value is not None:
-                    ws.cell(r, c, value)
+            values = {'sty': sty, 'desc': f'CloudFreeze Pillow {color}', 'key': key, 'q': q,
+                      'day': day, 'cbm': cbm, 'note': note, 'forwarder': forwarder, 'o': o}
+            for name, value in values.items():
+                col = self.pos[name]
+                if col and value is not None:
+                    ws.cell(r, col, value)
         add('PO260823TP', 'Bear', dt.date(2026, 10, 12), 20, 2, note='实际待核')
         add('CA260823TP', 'Cappuccino', dt.date(2026, 10, 16), 30, 3)
         add('UK260823TP', 'Cappuccino', dt.date(2026, 10, 17), 40, 4)
@@ -89,7 +105,18 @@ class ShipmentReportTests(unittest.TestCase):
         add('260823TP', 'Cappuccino', dt.date(2026, 10, 13), 7, 0.7, sty='CBL999')
         add('260823TP', 'Off White', dt.date(2026, 10, 14), 11, None)
         add('260823TP', 'White', dt.date(2026, 10, 14), None, 0.3)
+        # new-week behaviours learned from the real 2026-11 workbook:
+        # blank 货代 + FLEX booking prefix in 特殊说明 -> FLEXPORT
+        add('260823TP', 'Off White', dt.date(2026, 10, 15), 8, 0.8, forwarder=None, o='FLEX-4224961')
+        # FLEXPORT-liu variants count as FLEXPORT with a review flag
+        add('260823TP', 'Off White', dt.date(2026, 10, 15), 4, 0.4, forwarder='FLEXPORT-liu')
+        # channel-suffixed 外合同 belongs to the base order's sheet
+        add('260823TP\n 二部途歌出', 'Bear', dt.date(2026, 10, 15), 12, 1.2, forwarder=None, o='FLEX-4224962')
+        # genuinely unknown forwarder: neither AF nor booking prefix
+        add('260823TP', 'Off White', dt.date(2026, 10, 15), 3, 0.3, forwarder='DHL')
         wb.save(self.shipment)
+
+
 
     def run_report(self, name, *args):
         output = self.base / (name + '.xlsx')
@@ -104,26 +131,26 @@ class ShipmentReportTests(unittest.TestCase):
         issues = json.loads(output.with_suffix('.issues.json').read_text())
         wb = load_workbook(output, data_only=True)
         po = wb['PO#_260823TP']
-        self.assertEqual((po['K2'].value, po['M2'].value), (99, 99))  # unknown forwarder preserves original
+        self.assertEqual((po['K2'].value, po['M2'].value), (32, 3.2))  # 20 + 0(liu) + 12(channel suffix)
         self.assertEqual((po['K3'].value, po['M3'].value), (30, 3))
         self.assertEqual((po['K4'].value, po['M4'].value), (0, 0))  # UK falls outside inclusive end
-        self.assertEqual(po['K5'].value, 99)  # quantity unavailable, preserve original
-        self.assertAlmostEqual(po['M5'].value, 0.9)  # independent CBM still updates
-        self.assertEqual(po['K6'].value, 36)  # quantity updates despite missing CBM
-        self.assertEqual(po['M6'].value, 99)  # incomplete CBM preserves original
+        self.assertEqual((po['K5'].value, po['M5'].value), (99, 0.9))  # units blocked (None q), cbm sums 0.6+0.3
+        self.assertEqual((po['K6'].value, po['M6'].value), (48, 99))  # 25+11+8+4; DHL excluded; cbm blocked
         self.assertEqual(wb['PO#_260510TP visible']['K2'].value, 5)
         self.assertEqual(wb['PO#_260510TP hidden']['K2'].value, 5)
         self.assertEqual(wb['PO#_260510TP hidden'].sheet_state, 'hidden')
-        self.assertEqual(issues['区间来源行数'], 10)
+        self.assertEqual(issues['区间来源行数'], 14)
         kinds = {i['类型'] for i in issues['待确认']}
-        self.assertTrue({'货代反馈需核对', '货代无法识别', '重复PO明细页', '来源PO无客户明细页', '款号颜色无法唯一匹配'} <= kinds)
+        self.assertTrue({'货代反馈需核对', '货代无法识别', '重复PO明细页', '来源PO无客户明细页',
+                         '款号颜色无法唯一匹配', '货代按规则归并，请复核',
+                         '外合同带渠道后缀，按基础号归页'} <= kinds)
         entry = next(x for x in issues['来源PO货代汇总'] if x['PO'] == '260824-1')
         self.assertEqual(entry['数量'], 9)
         detail = next(x for x in issues['明细页核对'] if x['页'] == 'PO#_260823TP')
         recon = next(x for x in detail['按PO货代核对'] if x['PO'] == '260823' and x['货代'] == 'FLEXPORT')
-        self.assertEqual(recon['来源数量'], 69)
-        self.assertEqual(recon['已归集数量'], 36)
-        self.assertEqual(recon['未归集数量'], 33)
+        self.assertEqual(recon['来源数量'], 93)
+        self.assertEqual(recon['已归集数量'], 80)   # Bear 32 + Off White 48
+        self.assertEqual(recon['未归集数量'], 13)   # White 6 (blocked) + CBL999 7
         with zipfile.ZipFile(self.customer) as old, zipfile.ZipFile(output) as new:
             for name in old.namelist():
                 if name not in {'xl/worksheets/sheet2.xml', 'xl/worksheets/sheet3.xml', 'xl/worksheets/sheet4.xml'}:
@@ -133,8 +160,22 @@ class ShipmentReportTests(unittest.TestCase):
         self.assertEqual(formula_wb['TOTALS']['B2'].value, '=1+1')
         self.assertEqual(formula_wb['PO#_260823TP']['N2'].value, '=1+2')
         self.assertEqual(po['H1'].value, 'Ttl Units Shipped 10/12-10/16 (via LAURA)')
-        self.assertAlmostEqual(po['K7'].value, sum(po[f'K{r}'].value for r in range(2, 7)))
+        # K7 is a live SUM formula in the original: preserved, not overwritten with a value
+        self.assertEqual(str(formula_wb['PO#_260823TP']['K7'].value).upper(), '=SUM(K2:K6)')
+        # M7 has no formula (plain value cell): the recomputed total is written
+        self.assertAlmostEqual(po['M7'].value, sum(v for v in (po[f'M{r}'].value for r in range(2, 7))
+                                                  if isinstance(v, (int, float))))
+        preserved = next(i for i in issues['待确认'] if i['类型'] == '目标单元格原为公式，保留不覆盖')
+        self.assertIn('K7', preserved['单元格'])
 
+    def test_original_column_layout_still_supported(self):
+        """The pre-November layout (外合同G/数量K) must still resolve by header name."""
+        self.build_source(reordered=False)
+        result, output = self.run_report('oldlayout', '--start', '2026-10-17', '--end', '2026-10-20')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wb = load_workbook(output, data_only=True)
+        po = wb['PO#_260823TP']
+        self.assertEqual((po['R4'].value, po['T4'].value), (40, 4))  # UK row, new columns
     def test_partial_overlap_aborts_and_creates_no_output(self):
         result, output = self.run_report('overlap', '--start', '2026-10-15', '--end', '2026-10-17')
         self.assertNotEqual(result.returncode, 0)

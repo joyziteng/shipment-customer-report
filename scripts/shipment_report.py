@@ -27,8 +27,11 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 FORWARDERS = ('LAURA', 'FLEXPORT')
 MEASURES = ('units', 'percent', 'cbm')
 SOURCE_TITLE = '单证部--工厂实际提货数据汇总'
-SOURCE_HEADERS = {5: '款号', 6: '产品描述', 7: '外合同', 11: '数量',
-                  14: '工厂提货日', 19: '总体积', 25: '货代反馈情况', 32: '货代'}
+# Columns are located by header NAME (the workbook has rearranged columns between
+# versions); these are the exact/contains names required for each field.
+SOURCE_COLUMN_NAMES = {'style': '款号', 'po': '外合同', 'qty': '数量', 'date': '工厂提货日',
+                       'cbm': '总体积', 'forwarder': '货代', 'o': '特殊说明', 'note': '货代反馈情况'}
+REQUIRED_SOURCE_FIELDS = ('style', 'po', 'qty', 'date', 'cbm', 'forwarder')
 
 
 def po(value):
@@ -36,6 +39,36 @@ def po(value):
     text = re.sub(r'\s+', '', str(value or '').upper())
     text = re.sub(r'^PO#?_?', '', text)
     return re.sub(r'TP$', '', text)
+
+
+def order_base(value):
+    """Base order number (CA/UK + 6 digits + optional -suffix) and leftover channel text."""
+    text = re.sub(r'\s+', '', str(value or '')).upper()
+    match = re.match(r'^(PO#?)?((?:CA|UK)?\d{6}(?:-[A-Z0-9]+)?(?:TP)?)', text)
+    if not match:
+        return po(value), ''
+    base = po(match.group(2))
+    return base, text[match.end():]
+
+
+def resolve_forwarder(af, o):
+    """Forwarder from AF text; when AF is blank, booking-number prefix in 特殊说明."""
+    a = af.upper()
+    if a == 'LAURA':
+        return 'LAURA', None
+    if a == 'FLEXPORT':
+        return 'FLEXPORT', None
+    if 'FLEXPORT' in a:          # e.g. FLEXPORT-liu
+        return 'FLEXPORT', f'货代列写的是“{af}”，按 FLEXPORT 归入'
+    if 'LAURA' in a and 'FLEXPORT' not in a:
+        return 'LAURA', f'货代列写的是“{af}”，按 LAURA 归入'
+    if not a:
+        b = o.upper()
+        if b.startswith('FLEX'):
+            return 'FLEXPORT', f'货代列为空，按特殊说明“{o}”归入 FLEXPORT'
+        if b.startswith('LAURA'):
+            return 'LAURA', f'货代列为空，按特殊说明“{o}”归入 LAURA'
+    return None, None
 
 
 def style(value):
@@ -225,8 +258,14 @@ def read_customer(wb, cached, start, end, historical_year, issues, allow_overlap
         order_values = [cached[ws.title].cell(r, 5).value for r in rows]
         order_total = cached[ws.title].cell(summary, 5).value
         formula = str(ws.cell(summary, 5).value or '').upper()
-        if not (('SUM(' in formula) or (number(order_total) and all(number(v) for v in order_values)
-                                          and abs(sum(order_values) - order_total) < 1e-6)):
+        if 'SUM(' in formula:
+            pass
+        elif number(order_total) and all(number(v) for v in order_values):
+            if abs(sum(order_values) - order_total) > 1e-6:
+                issues.append({'类型': '汇总行合计与明细行不一致（按常量保留）', '页': ws.title,
+                               '单元格': f'E{summary}', '现有合计': order_total,
+                               '明细求和': sum(order_values), '处理': '本次区间列仍按明细行计算；历史差异请人工核对'})
+        else:
             raise ValueError(f'{ws.title}!E{summary} 无法确认汇总行，请检查布局')
         if any(ws.cell(r, 1).value and not style(ws.cell(r, 2).value) for r in range(2, summary)):
             issues.append({'类型': '客户行缺少款号', '页': ws.title,
@@ -270,15 +309,13 @@ def read_customer(wb, cached, start, end, historical_year, issues, allow_overlap
             cols = {key: values[0] for key, values in exact.items()}
             mode = '原区间'
         else:
-            first = ws.max_column + 1
-            if first + 5 > 16384:
-                raise ValueError(f'{ws.title} 追加日期列超过 Excel 列数上限')
-            cols = {(f, m): first + i * 3 + j for i, f in enumerate(FORWARDERS) for j, m in enumerate(MEASURES)}
-            mode = '新增区间'
-        for key, col in cols.items():
-            for merged in ws.merged_cells.ranges:
-                if merged.min_col <= col <= merged.max_col and merged.min_row <= summary and merged.max_row >= 1:
-                    raise ValueError(f'{ws.title} 目标列与合并区域 {merged} 交叠')
+            cols = {}
+            mode = '待追加'
+        if mode == '原区间':
+            for key, col in cols.items():
+                for merged in ws.merged_cells.ranges:
+                    if merged.min_col <= col <= merged.max_col and merged.min_row <= summary and merged.max_row >= 1:
+                        raise ValueError(f'{ws.title} 目标列与合并区域 {merged} 交叠')
         item = {'ws': ws, 'cached': cached[ws.title], 'rows': rows, 'summary': summary,
                 'columns': cols, 'templates': templates, 'mode': mode}
         sheets.append(item)
@@ -291,6 +328,51 @@ def read_customer(wb, cached, start, end, historical_year, issues, allow_overlap
     return sheets, index
 
 
+def source_columns(ws):
+    """Resolve source column indices by header name; tolerate reordered workbooks.
+
+    Exact header equality wins over substring containment ('货代反馈情况' must not
+    steal the '货代' column), and a description column without a header is found by
+    sampling text content, because the current workbook leaves that header blank.
+    """
+    headers = {col: str(ws.cell(1, col).value or '').strip() for col in range(1, 41)}
+    found = {}
+    for field, header in SOURCE_COLUMN_NAMES.items():
+        for col, name in headers.items():
+            if name == header:
+                found[field] = col
+                break
+    for field, header in SOURCE_COLUMN_NAMES.items():
+        if field in found:
+            continue
+        for col, name in headers.items():
+            if col in found.values() or not name:
+                continue
+            if header in name:
+                found[field] = col
+                break
+    missing = [f for f in REQUIRED_SOURCE_FIELDS if f not in found]
+    if missing:
+        raise ValueError(f'出货表第二页缺少必需列（按表头名）: {missing}')
+    desc = next((c for c in range(1, 41) if headers[c] in ('产品描述', '描述')
+                 or headers[c].upper() == 'DESCRIPTION'), None)
+    if desc is None:
+        best, best_hits = None, 0
+        for col in range(1, 41):
+            if headers[col] or col in found.values():
+                continue
+            hits = 0
+            for row in ws.iter_rows(min_row=2, min_col=col, max_col=col, max_row=60):
+                v = row[0].value
+                if isinstance(v, str) and len(v.strip()) >= 8:
+                    hits += 1
+            if hits >= 20 and hits > best_hits:
+                best, best_hits = col, hits
+        desc = best
+    found['description'] = desc
+    return found
+
+
 def read_source(path, start, end, index, issues):
     data = load_workbook(path, data_only=True, read_only=True)
     raw = load_workbook(path, data_only=False, read_only=True)
@@ -298,35 +380,48 @@ def read_source(path, start, end, index, issues):
         if len(data.worksheets) < 2 or data.worksheets[1].title != SOURCE_TITLE:
             raise ValueError(f'出货表第二页必须是 {SOURCE_TITLE}')
         ws, ws_raw = data.worksheets[1], raw.worksheets[1]
-        for col, name in SOURCE_HEADERS.items():
-            if name not in str(ws.cell(1, col).value or ''):
-                raise ValueError(f'出货表 {get_column_letter(col)} 列表头不符，预期包含 {name}')
+        col = source_columns(ws)
+        def cell(row, field):
+            c = col.get(field)
+            return None if c is None else row[c - 1].value
         records = []
         undated = defaultdict(list)
         aggregates = defaultdict(lambda: {'行号': [], '数量': Decimal(0), '体积': Decimal(0), '数量不可用行': [], '体积不可用行': []})
-        for r, (row, raw_row) in enumerate(zip(ws.iter_rows(min_row=2, max_col=32),
-                                               ws_raw.iter_rows(min_row=2, max_col=32)), start=2):
-            key = po(row[6].value)
-            day = date_value(row[13].value)
+        max_col = max((v for v in col.values() if v), default=32)
+        for r, (row, raw_row) in enumerate(zip(ws.iter_rows(min_row=2, max_col=max_col),
+                                               ws_raw.iter_rows(min_row=2, max_col=max_col)), start=2):
+            raw_po = str(cell(row, 'po') or '')
+            key, suffix = order_base(raw_po)
+            day = date_value(cell(row, 'date'))
             if day is None:
                 if key in index:
                     undated[key].append(r)
                 continue
             if not start <= day <= end:
                 continue
-            st, desc = style(row[4].value), str(row[5].value or '')
+            st = style(cell(row, 'style'))
+            desc = str(cell(row, 'description') or '') if col.get('description') else ''
             if not key:
                 issues.append({'类型': '区间内外合同缺失', '出货表行': r, '款号': st})
                 continue
-            f_raw = str(row[31].value or '').strip()
-            forwarder = f_raw.upper()
-            q, cbm = row[10].value, row[18].value
+            f_raw = str(cell(row, 'forwarder') or '').strip()
+            o_raw = str(cell(row, 'o') or '').strip()
+            forwarder, fwd_note = resolve_forwarder(f_raw, o_raw)
+            q, cbm = cell(row, 'qty'), cell(row, 'cbm')
             ok_q, ok_cbm = number(q) and q >= 0, number(cbm) and cbm >= 0
-            record = {'row': r, 'po': key, 'style': st, 'description': desc, 'date': str(day),
-                      'forwarder': forwarder, 'q': decimal(q) if ok_q else None,
-                      'cbm': decimal(cbm) if ok_cbm else None, 'note': str(row[24].value or '')}
+            note = str(cell(row, 'note') or '')
+            record = {'row': r, 'po': key, 'po_raw': raw_po, 'suffix': suffix, 'style': st,
+                      'description': desc, 'date': str(day),
+                      'forwarder': forwarder or f_raw.upper(),
+                      'resolved': forwarder,
+                      'q': decimal(q) if ok_q else None,
+                      'cbm': decimal(cbm) if ok_cbm else None, 'note': note}
             records.append(record)
-            group = aggregates[(key, f_raw or '（空）')]
+            if suffix and key in index:
+                issues.append({'类型': '外合同带渠道后缀，按基础号归页', '出货表行': r, '外合同': raw_po,
+                               '基础PO': key, '后缀': suffix, '货代': forwarder or f_raw,
+                               '处理': '与人工口径一致：款号颜色能落到该页则计入，否则列为未归集；请复核后缀单归属'})
+            group = aggregates[(key, forwarder or (f_raw or '（空）'))]
             group['行号'].append(r)
             if ok_q:
                 group['数量'] += decimal(q)
@@ -336,24 +431,27 @@ def read_source(path, start, end, index, issues):
                 group['体积'] += decimal(cbm)
             else:
                 group['体积不可用行'].append(r)
+            if fwd_note and key in index:
+                issues.append({'类型': '货代按规则归并，请复核', '出货表行': r, 'PO': key,
+                               '判定': fwd_note, '数量': q, '体积': cbm,
+                               '处理': '已按该货代计入'})
             if record['note'] and key in index:
-                issues.append({'类型': '货代反馈需核对', '出货表行': r, 'PO': key, '备注': record['note'],
+                issues.append({'类型': '货代反馈需核对', '出货表行': r, 'PO': key, '备注': note,
                                '数量': q, '体积': cbm, '处理': '按N/AF/K/S缓存计入，不根据备注猜测修正'})
-            if forwarder not in FORWARDERS and key in index:
+            if forwarder is None and key in index:
                 issues.append({'类型': '货代无法识别', '出货表行': r, 'PO': key, '货代': f_raw,
-                               '数量': q, '体积': cbm, '处理': '不猜测货代；原始汇总保留'})
+                               '特殊说明': o_raw, '数量': q, '体积': cbm, '处理': '不猜测货代；原始汇总保留'})
             if not st and key in index:
                 issues.append({'类型': '款号缺失', '出货表行': r, 'PO': key})
             if (not ok_q or not ok_cbm) and key in index:
                 issues.append({'类型': '数量或体积缓存不可用', '出货表行': r, 'PO': key, '数量': str(q), '体积': str(cbm),
-                               '源公式': [str(raw_row[c - 1].value) for c in (11, 19)]})
+                               '源公式': [str(raw_row[c - 1].value) for c in (col['qty'], col['cbm'])]})
             elif ok_q and q > 0 and cbm == 0 and key in index:
-                dims = [row[c - 1].value for c in (16, 17, 18)]
                 issues.append({'类型': '体积为零需核对', '出货表行': r, 'PO': key, '数量': q, '体积': cbm,
-                               '箱规P到R': dims, '源体积公式': str(raw_row[18].value),
+                               '源体积公式': str(raw_row[col['cbm'] - 1].value),
                                '处理': '按缓存0计入；检查箱规缺失及体积'})
             if key not in index:
-                issues.append({'类型': '来源PO无客户明细页', '出货表行': r, 'PO': key,
+                issues.append({'类型': '来源PO无客户明细页', '出货表行': r, 'PO': key, '外合同': raw_po,
                                '处理': '不创建工作表；原始汇总保留'})
         for key, row_numbers in sorted(undated.items()):
             issues.append({'类型': '提货日期不可识别（未计入任何区间）', 'PO': key,
@@ -369,6 +467,10 @@ def build_updates(item, records, start, end, issues):
     ws, cached, rows, summary, cols = (item[k] for k in ('ws', 'cached', 'rows', 'summary', 'columns'))
     keys = {po(ws.cell(r, 1).value) for r in rows}
     relevant = [rec for rec in records if rec['po'] in keys]
+    if not relevant:
+        return {}, {'页': ws.title, '状态': ws.sheet_state, '处理': '区间无出货记录，未改动', '列': {},
+                    '来源行数': 0, '来源行': [], '已完整归集来源行': [], '未完整归集来源行': [],
+                    '保留原值单元格': [], '按PO货代核对': [], '覆盖差异': []}
     lookup = defaultdict(list)
     for r in rows:
         lookup[(po(ws.cell(r, 1).value), style(ws.cell(r, 2).value))].append((r, ws.cell(r, 4).value))
@@ -390,14 +492,12 @@ def build_updates(item, records, start, end, issues):
                            '候选行': winners, '同款行': [r for r, _ in candidates],
                            '处理': '同PO同款原区间值保留；来源汇总独立列示'})
             continue
-        if rec['forwarder'] not in FORWARDERS:
-            for f in FORWARDERS:
-                for m in ('units', 'cbm'):
-                    blocked.add((target, f, m))
+        if rec.get('resolved') not in FORWARDERS:
             issues.append({'类型': '明细货代无法归集', '页': ws.title, '客户行': target, '出货表行': rec['row'],
-                           'PO': rec['po'], '处理': '保留该行各货代已有区间值，来源汇总列示'})
+                           'PO': rec['po'], '货代': rec['forwarder'],
+                           '处理': '该行不计入本区间；该行已有值保持不变并计入汇总'})
             continue
-        f = rec['forwarder']
+        f = rec['resolved']
         group = placed[(target, f)]
         group['records'].append(rec)
         for m, field in (('units', 'q'), ('cbm', 'cbm')):
@@ -408,6 +508,24 @@ def build_updates(item, records, start, end, issues):
     changes, differences, columns_json = {}, [], {}
     label = interval_label(start, end)
     blank_zero = sheet_prefers_blank(item)
+    preserved_formulas = []
+
+    def writable(r, col):
+        """Never overwrite a live formula cell; Excel recalculates it from inputs."""
+        cell = ws.cell(r, col)
+        if cell.data_type == 'f':
+            preserved_formulas.append({'单元格': f'{get_column_letter(col)}{r}'})
+            return False
+        return True
+
+    def record_expected(r, col, value, group, kind):
+        old = cached.cell(r, col).value
+        if item['mode'] == '原区间' and (not number(old) or abs(decimal(old) - value) > Decimal('0.000000001')):
+            differences.append({'单元格': f'{get_column_letter(col)}{r}', 'PO': po(ws.cell(r, 1).value),
+                                '货代': kind[0], '指标': kind[1], '原缓存': old, '新值': as_json_number(value),
+                                '原公式或值': str(ws.cell(r, col).value),
+                                '来源行': [rec['row'] for rec in group] if group else []})
+
     for f in FORWARDERS:
         columns_json[f] = {m: get_column_letter(cols[(f, m)]) for m in MEASURES}
         for m in MEASURES:
@@ -428,16 +546,12 @@ def build_updates(item, records, start, end, issues):
                     continue
                 col = cols[(f, m)]
                 old = cached.cell(r, col).value if item['mode'] == '原区间' else None
-                if m == 'percent' and item['mode'] == '原区间' and ws.cell(r, col).data_type == 'f':
-                    continue  # ratio formulas stay live and recalculate from the updated units
                 if value == 0 and (old is None if item['mode'] == '原区间' else blank_zero):
                     continue  # keep the sheet's blank-for-zero convention
+                if not writable(r, col):
+                    continue  # live formula: Excel recomputes it from the updated row
                 changes[(r, col)] = ('number', value, template_style(item, f, m, r))
-                if item['mode'] == '原区间' and (not number(old) or abs(decimal(old) - value) > Decimal('0.000000001')):
-                    differences.append({'单元格': f'{get_column_letter(col)}{r}', 'PO': po(ws.cell(r, 1).value),
-                                        '货代': f, '指标': m, '原缓存': old, '新值': as_json_number(value),
-                                        '原公式或值': str(ws.cell(r, col).value),
-                                        '来源行': [rec['row'] for rec in group['records']]})
+                record_expected(r, col, value, group['records'], (f, m))
         # Sum only the values actually visible, including any preserved cells.
         for m in ('units', 'cbm'):
             col = cols[(f, m)]
@@ -457,12 +571,9 @@ def build_updates(item, records, start, end, issues):
             if missing:
                 issues.append({'类型': '区间汇总不完整', '页': ws.title, '货代': f, '指标': m, '行': missing,
                                '处理': '汇总仅包括可确认数值，须结合原始汇总核对'})
-            changes[(summary, col)] = ('number', total, template_style(item, f, m, summary))
-            old_total = cached.cell(summary, col).value if item['mode'] == '原区间' else None
-            if item['mode'] == '原区间' and (not number(old_total) or abs(decimal(old_total) - total) > Decimal('0.000000001')):
-                differences.append({'单元格': f'{get_column_letter(col)}{summary}', 'PO': '本页合计',
-                                    '货代': f, '指标': m, '原缓存': old_total, '新值': as_json_number(total),
-                                    '原公式或值': str(ws.cell(summary, col).value), '来源行': []})
+            if writable(summary, col):
+                changes[(summary, col)] = ('number', total, template_style(item, f, m, summary))
+            record_expected(summary, col, total, [], (f, m))
             if m == 'units':
                 total_units = total
         all_orders = [cached.cell(r, 5).value for r in rows]
@@ -470,16 +581,15 @@ def build_updates(item, records, start, end, issues):
             total_order = sum((decimal(v) for v in all_orders), Decimal(0))
             percent_col = cols[(f, 'percent')]
             ratio = total_units / total_order
-            if not (item['mode'] == '原区间' and ws.cell(summary, percent_col).data_type == 'f'):
+            if writable(summary, percent_col):
                 changes[(summary, percent_col)] = ('number', ratio, template_style(item, f, 'percent', summary))
-            old_ratio = cached.cell(summary, percent_col).value if item['mode'] == '原区间' else None
-            if item['mode'] == '原区间' and (summary, percent_col) in changes and (
-                    not number(old_ratio) or abs(decimal(old_ratio) - ratio) > Decimal('0.000000001')):
-                differences.append({'单元格': f'{get_column_letter(percent_col)}{summary}', 'PO': '本页合计',
-                                    '货代': f, '指标': 'percent', '原缓存': old_ratio, '新值': as_json_number(ratio),
-                                    '原公式或值': str(ws.cell(summary, percent_col).value), '来源行': []})
+                record_expected(summary, percent_col, ratio, [], (f, 'percent'))
         else:
             issues.append({'类型': '汇总订单量不可用，比例保留', '页': ws.title, '货代': f})
+    if preserved_formulas:
+        issues.append({'类型': '目标单元格原为公式，保留不覆盖', '页': ws.title,
+                       '单元格': [x['单元格'] for x in preserved_formulas],
+                       '处理': '打开工作簿后由公式自行重算；差异值见“覆盖差异”'})
     if blocked:
         issues.append({'类型': '部分明细保留原值', '页': ws.title,
                        '单元格': [f'{get_column_letter(cols[(f, m)])}{r}' for r, f, m in sorted(blocked)],
@@ -736,11 +846,36 @@ def main(argv=None):
         sheets, index = read_customer(wb, cached, start, end, args.historical_year, issues, args.allow_overlap)
         totals_constant_cells(wb['TOTALS'], start, end, args.historical_year, issues)
         records, aggregates = read_source(shipment, start, end, index, issues)
+        # Allocate appended columns only for sheets that actually receive rows in this
+        # interval (the human workbook adds a new date block only on pages with shipments).
+        active = {rec['po'] for rec in records}
+        for item in sheets:
+            if item['mode'] != '待追加':
+                continue
+            keys = {po(item['ws'].cell(r, 1).value) for r in item['rows']}
+            if keys & active:
+                first = item['ws'].max_column + 1
+                if first + 5 > 16384:
+                    raise ValueError(f'{item["ws"].title} 追加日期列超过 Excel 列数上限')
+                item['columns'] = {(f, m): first + i * 3 + j
+                                   for i, f in enumerate(FORWARDERS) for j, m in enumerate(MEASURES)}
+                for col in item['columns'].values():
+                    for merged in item['ws'].merged_cells.ranges:
+                        if merged.min_col <= col <= merged.max_col and merged.min_row <= item['summary']:
+                            raise ValueError(f'{item["ws"].title} 目标列与合并区域 {merged} 交叠')
+                item['mode'] = '新增区间'
+            else:
+                item['mode'] = '无出货'
         details, patches = [], {}
         with zipfile.ZipFile(customer) as archive:
             for item in sheets:
+                if item['mode'] == '无出货':
+                    continue
                 changes, detail = build_updates(item, records, start, end, issues)
                 name = item['ws'].title
+                if not changes:
+                    details.append(detail)
+                    continue
                 if name not in paths or paths[name] == paths['TOTALS']:
                     raise ValueError(f'无法安全定位 PO 工作表 {name}')
                 patches[paths[name]] = sheet_xml_patch(archive.read(paths[name]), changes)
